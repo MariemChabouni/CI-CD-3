@@ -1,0 +1,176 @@
+name: TO_DEV
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+    branches:
+      - dev
+jobs:
+  TO_DEV_setup:
+    name: TO_DEV_setup
+    runs-on: ubuntu-latest
+    outputs:
+       matrix: ${{ steps.setmatrix.outputs.matrix }}
+    steps:
+     - name: Check out Repository
+       uses: actions/checkout@v3
+     - name: Get the pull request title
+       id: get_title
+       run: echo "::set-output name=title::${{ github.event.pull_request.title}}" 
+     - name: pull request
+       run:  echo "${{ steps.get_title.outputs.title }}"
+     - name: Extract Jira Ticket name anf jobs names
+       id: extract
+       run: |
+        input_string="${{ steps.get_title.outputs.title }}"
+        ticket_jira=$(echo $input_string | sed -n 's/.*\[\([^]]*\)\].*/\1/p')
+        echo "::set-output name=ticket_jira::$ticket_jira"
+        jobs_names=$(echo $input_string | sed -n 's/.*{\([^}]*\)}.*$/\1/p')
+        echo "::set-output name=jobs_names::$jobs_names"
+     - name: Set Dynamic Matrix containing job names
+       id: setmatrix
+       env: 
+        message: "${{ steps.extract.outputs.jobs_names }}"
+       run: |
+           matrixStringifiedObject="{\"include\":["
+           IFS=',' read -ra words <<< "$message"
+           if [ ${#words[@]} -eq 0 ]; then
+              echo "No jobs found"
+              exit 1
+            fi
+            for word in "${words[@]}"; do
+              matrixStringifiedObject+="{\"word\":\"$word\"},"
+            done
+                 matrixStringifiedObject+="]}"
+           echo "::set-output name=matrix::$matrixStringifiedObject"
+       shell: bash
+ 
+     - name: Check JIRA TICKET
+       uses: indiesdev/curl@v1.1
+       id: get_ticket
+       with:
+        url: 'https://olive-soft.atlassian.net/rest/api/3/issue/${{ steps.extract.outputs.ticket_jira }}'
+        method: 'GET'
+        accept: 200,201,204
+        basic-auth-token: ${{ secrets.JIRA_TOKEN }}
+        log-response: true
+    
+ 
+  TO_DEV_build:
+    name: TO_DEV_build
+    needs: TO_DEV_setup
+    runs-on: ubuntu-latest
+    steps:
+     - name: Check out Repository
+       uses: actions/checkout@v3
+     - name: Set up JDK 11
+       uses: actions/setup-java@v3
+       with:
+        java-version: "11"
+        distribution: temurin  
+        cache: maven
+     - name: Install Maven
+       uses: yuzhiyongcn/setup-maven@v1.0.0
+     - name: Download and unzip builder plugin
+       uses: schmiddim/action-wget-unzip@v2
+       with:
+        url: http://20.19.161.38:8080/p2/talend_ci.zip
+        destination: /builder
+     - name: Maven install builder plugin
+       run: mvn -f DEMO_CI_CD/poms/sample_pom.xml --batch-mode -s
+        DEMO_CI_CD/poms/maven_settings.xml install:install-file
+        -Dfile=/home/runner/work/DEMO_CI_CD/DEMO_CI_CD/builder/builder-maven-plugin-8.0.1.jar
+        -DpomFile=/home/runner/work/DEMO_CI_CD/DEMO_CI_CD/builder/builder-maven-plugin-8.0.1.pom
+     - name: Maven install P2 and generate POMs
+       run: mvn -f DEMO_CI_CD/poms/pom.xml --batch-mode -e -fae -am -s
+        DEMO_CI_CD/poms/maven_settings.xml
+        org.talend.ci:builder-maven-plugin:8.0.1:generateAllPoms
+        -Dlicense.path=http://20.19.161.38:8080/p2/license
+        -Dtalend.studio.p2.base=http://20.19.161.38:8080/p2
+        -Dtalend.studio.p2.update=http://20.19.161.38:8080/p2
+     - name: check module
+       run: pwd && cat DEMO_CI_CD/poms/pom.xml | sed '/<modules>/,/<\/modules>/!d' && cd
+        DEMO_CI_CD/poms/jobs/process && ls
+     - name: Maven build & publish Talend artifacts to Talend Cloud
+       run: mvn -f DEMO_CI_CD/poms/pom.xml --batch-mode -s
+        DEMO_CI_CD/poms/maven_settings.xml -fae -am
+        -Dlicense.path=http://20.19.161.38:8080/p2/license
+        -Dtalend.studio.p2.base=http://20.19.161.38:8080/p2
+        -Dtalend.studio.p2.update=http://20.19.161.38:8080/p2 -pl
+        jobs/process/first_job_0.1 -Pcloud-publisher
+        -Dservice.url=https://tmc.eu.cloud.talend.com/inventory/
+        -Dcloud.token=igoZ4tK3R_2Hzf1Zj0XSkecbHPchWMEJzKILHp0n6EFKOJvDWj86SqOJnId8nyYi
+        -Dcloud.publisher.screenshot=true -Dcloud.publisher.environment=dev
+        -Dcloud.publisher.workspace=dev deploy
+      
+
+ 
+       
+  TO_DEV_deploy:
+    name: TO_DEV_deploy
+    needs: [TO_DEV_setup,TO_DEV_build]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.TO_DEV_setup.outputs.matrix) }}
+    steps:
+    - run: echo Run ${{ matrix.word }}
+    
+    - name: Get Artifacts from Commit message
+      uses: fjogeleit/http-request-action@v1
+      id: artifacts
+      with:
+        url: 'https://api.eu.cloud.talend.com/tmc/v2.6/artifacts?name=${{ matrix.word }}'
+        method: 'GET'
+        bearerToken: ${{ secrets.TMC_TOKEN }}
+        customHeaders: '{"Content-Type": "application/json"}'
+    - name: Create Task
+      uses: fjogeleit/http-request-action@v1
+      id: new_task
+      with:
+        url: 'https://api.eu.cloud.talend.com/tmc/v2.6/executables/tasks'
+        method: 'POST'
+        bearerToken: ${{ secrets.TMC_TOKEN }}
+        customHeaders: '{"Content-Type": "application/json"}'
+        data: '{"workspaceId": "${{fromJson( steps.artifacts.outputs.response).items[0].workspace.id }}", "name":"  ${{ matrix.word }}  task to test",  "description": "Task detail description","tags": [ "tag1","tag2" ], "connections": {}, "parameters": {},"resources": {}, "artifact": {  "id": "${{fromJson( steps.artifacts.outputs.response).items[0].id }}",  "version": "${{fromJson( steps.artifacts.outputs.response).items[0].versions[0] }}"}, "autoUpgradeInfo": { "autoUpgradable": false,  "overrideWithDefaultParameters": false  },  "environmentId": "${{fromJson( steps.artifacts.outputs.response).items[0].workspace.environment.id }}"}'
+    - name: Get Executable Tasks
+      uses: fjogeleit/http-request-action@v1
+      with:
+        url: 'https://api.eu.cloud.talend.com/tmc/v2.6/executables/tasks'
+        method: 'GET'
+        bearerToken: ${{ secrets.TMC_TOKEN }}
+        customHeaders: '{"Content-Type": "application/json"}'
+    - name: Set timezone
+      run: sudo timedatectl set-timezone Europe/London
+    - name: Get current date in Europe/London timezone
+      id: date
+      run: echo "::set-output name=date::$(date +'%Y-%m-%d')"
+    - name: Get London Time
+      id: london_time
+      run: |
+        echo "::set-output name=london_time::$(date -d '+2 minutes' '+%H:%M')"
+      shell: bash
+      env:
+        TZ: Europe/London
+    - name : Configure Task execution
+      uses: fjogeleit/http-request-action@v1
+      with:
+        url: 'https://api.eu.cloud.talend.com/tmc/v2.6/executables/tasks/${{ fromJson(steps.new_task.outputs.response).id }}/run-config'
+        method: 'PUT'
+        bearerToken: ${{ secrets.TMC_TOKEN }}
+        customHeaders: '{"Content-Type": "application/json"}'
+        data: '{"trigger": { "type": "ONCE", "interval": 1, "startDate": "${{ steps.date.outputs.date }}", "timeZone": "Europe/London","atTimes": { "type": "AT_TIME", "time": "${{ steps.london_time.outputs.london_time }}" }, "atDays": {}, "webhook": {}},"runtime": {"type": "CLOUD"} }'
+
+  TO_DEV_status:
+    name: TO_DEV_status
+    needs: [TO_DEV_setup,TO_DEV_build,TO_DEV_deploy]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Modify the status of JIRA TICKET to TO code review 
+      uses: indiesdev/curl@v1.1
+      id: update_ticket
+      with:
+        url: 'https://olive-soft.atlassian.net/rest/api/2/issue/${{ steps.extract.outputs.ticket_jira }}/transitions'
+        method: 'POST'
+        accept: 200,201,204
+        basic-auth-token: ${{ secrets.JIRA_TOKEN }}
+        log-response: true
+        body : '{"transition": { "id": "4" } }'
