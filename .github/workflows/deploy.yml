@@ -1,8 +1,5 @@
 name: DEPLOYED_TO_DEV
 on:
-  push:
-   branches:
-    - master
   pull_request:
     types:
       - closed
