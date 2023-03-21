@@ -1,5 +1,8 @@
 name: TO_DEV
 on:
+  push:
+    branches:
+      - master
   pull_request:
     types: [opened, edited, reopened]
     branches:
